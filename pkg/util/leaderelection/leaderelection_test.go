@@ -61,7 +61,7 @@ var _ = ginkgo.Describe("objectToLease", func() {
 		})
 	})
 
-	ginkgo.Context("When obejct is other type", func() {
+	ginkgo.Context("When object is other type", func() {
 		ginkgo.BeforeEach(func() {
 			object = "invalid object"
 		})
@@ -184,7 +184,7 @@ var _ = ginkgo.Describe("LeaderManager", func() {
 			assertNotElected(lm, leaderNotify, synced)
 		})
 		ginkgo.It("should ignore lease with another namespace", func() {
-			lease := generateLease(hostname, "anotherNamspace", name)
+			lease := generateLease(hostname, "anotherNamespace", name)
 			lm.OnAdd(lease, true)
 			assertNotElected(lm, leaderNotify, synced)
 		})
@@ -247,7 +247,7 @@ var _ = ginkgo.Describe("LeaderManager", func() {
 
 	ginkgo.Describe("When lease is deleted", func() {
 		ginkgo.Describe("we are leader", func() {
-			ginkgo.It("shoud not be leader anymore unless elected", func() {
+			ginkgo.It("should not be leader anymore unless elected", func() {
 				ginkgo.By("Elected as leader")
 				lm.OnAdd(initLease, true)
 				assertNotifyElected(lm, leaderNotify)
@@ -287,6 +287,178 @@ var _ = ginkgo.Describe("LeaderManager", func() {
 			})
 		})
 
+	})
+})
+
+var _ = ginkgo.Describe("Nil checks for callbacks", func() {
+	var initLease *coordinationv1.Lease
+	var hostname, namespace, name string
+	var lm *leaderManager
+
+	ginkgo.BeforeEach(func() {
+		hostname = "dev"
+		namespace = "kube-system"
+		name = "hami-scheduler"
+		initLease = generateLease(hostname, namespace, name)
+	})
+
+	ginkgo.Context("When callbacks are nil", func() {
+		ginkgo.BeforeEach(func() {
+			// Create LeaderManager with empty callbacks (nil functions)
+			lm = NewLeaderManager(hostname, namespace, name, LeaderCallbacks{})
+		})
+
+		ginkgo.It("should not panic when OnStartedLeading is called in onAdd", func() {
+			g.Expect(func() {
+				lm.OnAdd(initLease, true)
+			}).ShouldNot(g.Panic())
+			g.Expect(lm.IsLeader()).Should(g.BeTrue())
+		})
+
+		ginkgo.It("should not panic when OnStartedLeading is called in onUpdate", func() {
+			anotherLease := acquireLeaseWithNewHost(initLease, "another")
+			lm.OnAdd(anotherLease, true)
+
+			g.Expect(func() {
+				newLease := acquireLeaseWithNewHost(initLease, hostname)
+				lm.OnUpdate(anotherLease, newLease)
+			}).ShouldNot(g.Panic())
+			g.Expect(lm.IsLeader()).Should(g.BeTrue())
+		})
+
+		ginkgo.It("should not panic when OnStoppedLeading is called in onUpdate", func() {
+			lm.OnAdd(initLease, true)
+
+			g.Expect(func() {
+				challengerLease := acquireLeaseWithNewHost(initLease, "another")
+				lm.OnUpdate(initLease, challengerLease)
+			}).ShouldNot(g.Panic())
+			g.Expect(lm.IsLeader()).Should(g.BeFalse())
+		})
+
+		ginkgo.It("should not panic when OnStoppedLeading is called in onDelete", func() {
+			lm.OnAdd(initLease, true)
+
+			g.Expect(func() {
+				lm.OnDelete(initLease)
+			}).ShouldNot(g.Panic())
+			g.Expect(lm.IsLeader()).Should(g.BeFalse())
+		})
+	})
+
+	ginkgo.Context("When only OnStartedLeading is provided", func() {
+		var notified bool
+
+		ginkgo.BeforeEach(func() {
+			notified = false
+			callbacks := LeaderCallbacks{
+				OnStartedLeading: func() {
+					notified = true
+				},
+				// OnStoppedLeading is nil
+			}
+			lm = NewLeaderManager(hostname, namespace, name, callbacks)
+		})
+
+		ginkgo.It("should call OnStartedLeading but not panic on OnStoppedLeading", func() {
+			lm.OnAdd(initLease, true)
+			g.Expect(notified).Should(g.BeTrue())
+
+			g.Expect(func() {
+				lm.OnDelete(initLease)
+			}).ShouldNot(g.Panic())
+		})
+	})
+
+	ginkgo.Context("When only OnStoppedLeading is provided", func() {
+		var stopped bool
+
+		ginkgo.BeforeEach(func() {
+			stopped = false
+			callbacks := LeaderCallbacks{
+				// OnStartedLeading is nil
+				OnStoppedLeading: func() {
+					stopped = true
+				},
+			}
+			lm = NewLeaderManager(hostname, namespace, name, callbacks)
+		})
+
+		ginkgo.It("should not panic on OnStartedLeading but call OnStoppedLeading", func() {
+			g.Expect(func() {
+				lm.OnAdd(initLease, true)
+			}).ShouldNot(g.Panic())
+
+			lm.OnDelete(initLease)
+			g.Expect(stopped).Should(g.BeTrue())
+		})
+	})
+})
+
+var _ = ginkgo.Describe("Nil checks for lease fields", func() {
+	var hostname, namespace, name string
+	var lm *leaderManager
+
+	ginkgo.BeforeEach(func() {
+		hostname = "dev"
+		namespace = "kube-system"
+		name = "hami-scheduler"
+		lm = NewLeaderManager(hostname, namespace, name, LeaderCallbacks{})
+	})
+
+	ginkgo.Context("When lease is nil", func() {
+		ginkgo.It("isHolderOf should return false", func() {
+			result := lm.isHolderOf(nil)
+			g.Expect(result).Should(g.BeFalse())
+		})
+	})
+
+	ginkgo.Context("When lease.Spec.HolderIdentity is nil", func() {
+		ginkgo.It("isHolderOf should return false", func() {
+			lease := &coordinationv1.Lease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: namespace,
+				},
+				Spec: coordinationv1.LeaseSpec{
+					HolderIdentity: nil, // nil holder identity
+				},
+			}
+			result := lm.isHolderOf(lease)
+			g.Expect(result).Should(g.BeFalse())
+		})
+	})
+
+	ginkgo.Context("When observedLease is nil", func() {
+		ginkgo.It("isLeaseValid should return false", func() {
+			lm.observedLease = nil
+			result := lm.isLeaseValid(time.Now())
+			g.Expect(result).Should(g.BeFalse())
+		})
+
+		ginkgo.It("IsLeader should return false", func() {
+			lm.observedLease = nil
+			result := lm.IsLeader()
+			g.Expect(result).Should(g.BeFalse())
+		})
+	})
+
+	ginkgo.Context("When LeaseDurationSeconds is nil", func() {
+		ginkgo.It("isLeaseValid should return false", func() {
+			lease := &coordinationv1.Lease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: namespace,
+				},
+				Spec: coordinationv1.LeaseSpec{
+					HolderIdentity:       func() *string { s := hostname; return &s }(),
+					LeaseDurationSeconds: nil, // nil duration
+				},
+			}
+			lm.setObservedRecord(lease)
+			result := lm.isLeaseValid(time.Now())
+			g.Expect(result).Should(g.BeFalse())
+		})
 	})
 })
 
