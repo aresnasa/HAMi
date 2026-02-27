@@ -454,3 +454,170 @@ Node Annotation "hami.io/node.nvidia.device-pair-score" 存储 NVLink 矩阵：
 | **Leader Election** | Coordination/v1 Lease | `pkg/util/leaderelection/` |
 | **接口抽象设计** | 多异构设备统一接口 | `pkg/device/devices.go` |
 | **并发调度安全** | 分布式锁 + 内存锁组合 | `pkg/util/nodelock/nodelock.go` |
+
+---
+
+## 五、Upstream 同步变更记录（2026-02 批次，共 31 commits）
+
+> 同步自 `Project-HAMi/HAMi@cb077d5`，合并到本 fork `master` 分支。
+
+### 🐛 Bug 修复
+
+#### BUG-1：`calcScore()` 中 `ctrfit` 初始值错误导致 panic（#1626）
+- **文件**：`pkg/scheduler/score.go`
+- **问题**：`ctrfit` 初始值为 `false`，当 Pod 没有任何设备请求（`resourceReqs` 为 nil）时，`range` 循环不执行，节点被错误排除，并可能触发 panic（issue #1327）。
+- **修复**：将初始值改为 `true`。Go 的 `range nil` 安全跳过循环，无设备需求的 Pod 应能调度到任意节点。
+```
+// 修复前
+ctrfit := false
+// 修复后
+ctrfit := true  // Pod 无设备需求时，默认节点适配
+```
+
+#### BUG-2：Webhook 中调度器名称判断运算符优先级错误（#1627）
+- **文件**：`pkg/scheduler/webhook.go`
+- **问题**：`||` 和 `&&` 混用时缺少括号，导致 `ForceOverwriteDefaultScheduler=false` 时逻辑短路异常，具有资源请求的 Pod 被错误放行而不注入调度器名称。
+- **修复**：添加括号明确优先级。
+```go
+// 修复前（有歧义）
+if pod.Spec.SchedulerName != "" &&
+    pod.Spec.SchedulerName != corev1.DefaultSchedulerName || !config.ForceOverwriteDefaultScheduler &&
+    ...
+// 修复后（明确）
+if pod.Spec.SchedulerName != "" &&
+    (pod.Spec.SchedulerName != corev1.DefaultSchedulerName || !config.ForceOverwriteDefaultScheduler) &&
+    ...
+```
+
+#### BUG-3：LeaderElection 中 nil 指针 panic（#1603）
+- **文件**：`pkg/util/leaderelection/leaderelection.go`
+- **问题**：`OnStartedLeading`/`OnStoppedLeading` callback 为 nil 时直接调用会 panic；`isHolderOf()` 未检查 `lease == nil`；`isLeaseValid()` 未检查 `LeaseDurationSeconds == nil`。
+- **修复**：所有调用点前加 nil guard；`isHolderOf()` 和 `isLeaseValid()` 加防御性检查。
+
+#### BUG-4：Iluvatar 设备 binpack/spread 策略反转（#1631）
+- **文件**：`pkg/device/iluvatar/device.go`
+- **问题**：Iluvatar 设备实现中 binpack 和 spread 排序逻辑写反，导
+致 binpack 时实际执行 spread 行为。
+- **修复**：交换排序比较方向，与 NVIDIA 实现保持一致。
+
+#### BUG-5：统一显存 GPU（GB10/DGX Spark）`GetMemoryInfo` 返回 NOT_SUPPORTED 导致 panic（#1637）
+- **文件**：`pkg/device-plugin/nvidiadevice/nvinternal/plugin/register.go`、`cmd/vGPUmonitor/metrics.go`、`pkg/device/nvidia/device.go`
+- **问题**：NVIDIA GB10 等统一内存架构 GPU 调用 `nvmlDeviceGetMemoryInfo()` 返回 `ERROR_NOT_SUPPORTED`，原代码直接 panic。
+- **修复**：
+  - `register.go`：捕获 `NOT_SUPPORTED`，回退到配置文件中的 `PreConfiguredDeviceMemory` 值；若未配置则跳过该设备（`continue`）而非 panic。
+  - `metrics.go`：跳过不支持显存查询的设备的内存指标采集。
+  - `device.go`：`NodeDefaultConfig` 新增 `PreConfiguredDeviceMemory` 字段，支持 Helm values 按节点配置。
+
+#### BUG-6：`Device_memory_desc_of_container` 指标基数爆炸（#1628）
+- **文件**：`cmd/vGPUmonitor/metrics.go`
+- **问题**：每个容器的每块设备都生成独立 label 维度组合，随容器数量线性增长，导致 Prometheus 基数爆炸（cardinality explosion），内存占用急剧上升。
+- **修复**：统一显存和利用率指标的 label 集合，合并冗余维度，减少时间序列数量。
+
+---
+
+### 🔒 安全加固
+
+#### SEC-1：HTTP 请求体大小限制，防止 DoS（#1620）
+- **文件**：`pkg/scheduler/routes/route.go`
+- **问题**：`/predicate` 和 `/bind` 两个 HTTP 端点未限制请求体大小，攻击者可发送超大 payload 耗尽内存（issue #554）。
+- **修复**：用 `io.LimitReader` 包装 `r.Body`，限制为 1MB。
+```go
+const maxRequestSize = 1024 * 1024 // 1MB
+limitedReader := io.LimitReader(r.Body, maxRequestSize)
+body := io.TeeReader(limitedReader, &buf)
+```
+
+---
+
+### ✨ 新功能
+
+#### FEAT-1：Webhook 阶段提前检查 ResourceQuota（#1605）
+- **文件**：`pkg/scheduler/webhook.go`
+- **新增**：`fitResourceQuota()` 函数，在 Pod 准入阶段（Webhook）即检查 namespace 级别的显存/算力配额，配额不足时直接 Deny，避免 Pod 进入调度队列后才失败。
+- **当前限制**：仅支持 NVIDIA GPU 设备。
+- **流程位置**：位于 `MutateAdmission` 之后、`json.Marshal` 之前。
+```go
+if !fitResourceQuota(pod) {
+    return admission.Denied("exceeding resource quota")
+}
+```
+
+#### FEAT-2：Ascend 910C SuperPod 模块对儿分配（#1610）
+- **文件**：`pkg/device/ascend/device.go`
+- **背景**：Ascend 910C 的物理架构中，最小分配单元是一个物理模块（2 个 NPU）。请求 1 个 NPU 实际需要占用 2 个。
+- **实现**：
+  - `MutateAdmission()` 中检测 `Ascend910C` 设备类型：请求数为 1 时自动扩展为 2；奇数请求（3、5、7…）直接拒绝并返回错误。
+  - `Fit()` 中新增 `computeBestCombination910C()`：按物理卡（每卡 2 NPU）分组，选择同一物理模块内的 NPU 对进行分配，保证模块内局部性。
+```go
+const Ascend910CType = "Ascend910C"
+// MutateAdmission 中
+if reqNum == 1 {
+    reqNum = 2  // 自动扩展到最小分配单元
+} else if reqNum%2 != 0 {
+    return false, errors.New("Ascend910C device request must be 1 or 2*n")
+}
+```
+
+#### FEAT-3：Prometheus ServiceMonitor 支持（#1614、#1633）
+- **文件**：`charts/hami/templates/scheduler/servicemonitor.yaml`、`charts/hami/templates/device-plugin/servicemonitor.yaml`
+- **新增**：Helm chart 中为 scheduler 和 device-plugin 分别添加 `ServiceMonitor` CRD 资源，配合 Prometheus Operator 实现自动服务发现和指标采集。
+- **配置**：通过 `values.yaml` 中 `scheduler.serviceMonitor.enabled` 和 `devicePlugin.serviceMonitor.enabled` 开关控制。
+
+#### FEAT-4：指标新增 `device_type` 标签（#1612）
+- **文件**：`cmd/scheduler/metrics.go`
+- **变更**：调度器指标中所有与设备相关的 Gauge/Counter 新增 `device_type` label，便于在 Grafana 中按设备类型（NVIDIA/Ascend/Cambricon 等）分组展示。
+
+#### FEAT-5：vGPUmonitor 支持自定义 `metrics-bind-address`（#1613）
+- **文件**：`cmd/vGPUmonitor/main.go`
+- **变更**：新增 `--metrics-bind-address` 命令行参数，允许自定义监控端点监听地址，不再硬编码 `:9394`。
+
+#### FEAT-6：`checkUUID` 提取为公共函数复用（#1622）
+- **文件**：`pkg/device/devices.go`（新增）、`pkg/device/nvidia/device.go`（删除私有方法）
+- **变更**：将 NVIDIA 私有的 `checkUUID()` 重构为包级公共函数 `device.CheckUUID()`，其他设备厂商实现可直接复用 UUID 白名单/黑名单过滤逻辑。
+```go
+// 从 nvidia 私有方法提升为 device 包公共函数
+func CheckUUID(annos map[string]string, deviceID, useUUIDAnno, noUseUUIDAnno, commonWord string) bool
+```
+
+---
+
+### ⚡ 性能优化
+
+#### PERF-1：NodeLock 重试策略改用指数退避（#1663）
+- **文件**：`pkg/util/nodelock/nodelock.go`
+- **变更**：`DefaultStrategy` 中 `Factor` 从 `1.0`（线性）改为 `2.0`（指数），`Jitter` 从 `0.1` 改为 `0.5`（更大随机抖动），减少高并发场景下多调度器实例争抢节点锁时的惊群效应。
+```go
+DefaultStrategy = wait.Backoff{
+    Steps:    5,
+    Duration: 100 * time.Millisecond,
+    Factor:   2.0,  // 指数退避：100ms → 200ms → 400ms → 800ms → 1600ms
+    Jitter:   0.5,  // ±50% 随机抖动
+}
+```
+
+---
+
+### 📦 依赖升级
+
+| 依赖 | 旧版本 | 新版本 |
+|------|--------|--------|
+| `google.golang.org/grpc` | 1.78.0 | 1.79.1 |
+| `github.com/NVIDIA/k8s-device-plugin` | — | 最新 |
+| `github.com/NVIDIA/nvidia-container-toolkit` | — | 最新 |
+| `golang.org/x/tools` | 0.41.0 | 0.42.0 |
+| `github.com/onsi/gomega` | 1.39.0 | 1.39.1 |
+| `github.com/onsi/ginkgo/v2` | 2.27.5 | 2.28.1 |
+| `docker/build-push-action` (CI) | 6.18.0 | 6.19.2 |
+| `docker/login-action` (CI) | 3.6.0 | 3.7.0 |
+| `aquasecurity/trivy-action` (CI) | 0.33.1 | 0.34.1 |
+
+---
+
+### 🧪 测试覆盖增强
+
+| 新增测试文件/函数 | 覆盖场景 |
+|---|---|
+| `pkg/scheduler/routes/route_test.go` | `LimitReader` 超大请求体触发 EOF |
+| `pkg/scheduler/webhook_test.go` `TestSchedulerNameEmptyNoOverwrite` | `ForceOverwriteDefaultScheduler=false` 时调度器名称注入 |
+| `pkg/util/leaderelection/leaderelection_test.go` | nil callback、nil lease、nil HolderIdentity、nil LeaseDurationSeconds 全场景 |
+| `pkg/device/ascend/device_test.go` | 910C 奇数请求拒绝、模块对儿分配、`computeBestCombination910C` |
